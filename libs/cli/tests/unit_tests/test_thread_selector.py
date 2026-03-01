@@ -1002,6 +1002,32 @@ class TestResumeThread:
             for call in app._mount_message.call_args_list  # type: ignore[union-attr]
         )
 
+    @pytest.mark.asyncio
+    async def test_http_resume_without_local_agent_uses_session_load(self) -> None:
+        """HTTP mode should resume via remote session/load without local agent."""
+        from textual.css.query import NoMatches as _NoMatches
+
+        app = DeepAgentsApp(thread_id="old-thread", transport="http")
+        app._agent = None
+        app._session_state = MagicMock()
+        app._session_state.thread_id = "old-thread"
+        app._pending_messages = MagicMock()
+        app._queued_widgets = MagicMock()
+        app._clear_messages = AsyncMock()  # type: ignore[assignment]
+        app._token_tracker = MagicMock()
+        app._update_status = MagicMock()  # type: ignore[assignment]
+        app._create_http_session = AsyncMock()  # type: ignore[assignment]
+        app._load_thread_history_http = AsyncMock()  # type: ignore[assignment]
+        app._mount_message = AsyncMock()  # type: ignore[assignment]
+        app.query_one = MagicMock(side_effect=_NoMatches())  # type: ignore[assignment]
+
+        await app._resume_thread("new-thread")
+
+        assert app._lc_thread_id == "new-thread"
+        assert app._session_state.thread_id == "new-thread"
+        app._create_http_session.assert_awaited_once_with(thread_id="new-thread")
+        app._load_thread_history_http.assert_awaited_once()
+
 
 class TestBuildThreadMessage:
     """Tests for DeepAgentsApp._build_thread_message."""

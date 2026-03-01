@@ -17,6 +17,7 @@ Note: in non-interactive mode (`-n`), auto-approval is determined solely by
 whether a `--shell-allow-list` is present, not by the `--auto-approve` CLI
 flag. See `run_non_interactive` for details.
 """
+# ruff: noqa: I001
 
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from langchain.agents.middleware.human_in_the_loop import ActionRequest, HITLRequest
@@ -36,6 +38,7 @@ from rich.style import Style
 from rich.text import Text
 
 from deepagents_cli.agent import DEFAULT_AGENT_NAME, create_cli_agent
+from deepagents_cli.client.service_transport import make_service_transport
 from deepagents_cli.config import (
     SHELL_TOOL_NAMES,
     build_langsmith_thread_url,
@@ -43,9 +46,14 @@ from deepagents_cli.config import (
     is_shell_command_allowed,
     settings,
 )
+from deepagents_cli.core.contracts import SessionCreateRequest
 from deepagents_cli.file_ops import FileOpTracker
 from deepagents_cli.model_config import ModelConfigError
 from deepagents_cli.sessions import generate_thread_id, get_checkpointer
+from deepagents_cli.service.manager import (
+    acquire_service_lease,
+    release_service_lease,
+)
 from deepagents_cli.tools import fetch_url, http_request, web_search
 
 if TYPE_CHECKING:
@@ -529,6 +537,8 @@ async def run_non_interactive(
     sandbox_type: str = "none",  # str (not None) to match argparse choices
     sandbox_id: str | None = None,
     sandbox_setup: str | None = None,
+    transport: str = "inproc",
+    service_url: str | None = None,
     *,
     quiet: bool = False,
     stream: bool = True,
@@ -557,6 +567,8 @@ async def run_non_interactive(
         sandbox_id: Optional existing sandbox ID to reuse.
         sandbox_setup: Optional path to setup script to run in the sandbox
             after creation.
+        transport: Execution transport (`"inproc"` or `"http"`).
+        service_url: Optional service base URL for HTTP transport.
         quiet: When `True`, all console output (headers, status messages,
             tool notifications, HITL decisions, errors) is redirected to
             stderr so that only the agent's response text appears on stdout.
@@ -596,6 +608,20 @@ async def run_non_interactive(
         header = _build_non_interactive_header(assistant_id, thread_id)
         console.print(header)
         console.print()
+
+    if transport == "http":
+        return await _run_non_interactive_http(
+            message=message,
+            assistant_id=assistant_id,
+            model_name=model_name,
+            model_params=model_params,
+            sandbox_type=sandbox_type,
+            sandbox_id=sandbox_id,
+            sandbox_setup=sandbox_setup,
+            quiet=quiet,
+            stream=stream,
+            service_url=service_url,
+        )
 
     sandbox_backend = None
     exit_stack = contextlib.ExitStack()
@@ -695,3 +721,116 @@ async def run_non_interactive(
             console.print(
                 f"[yellow]Warning: Resource cleanup failed: {cleanup_err}[/yellow]"
             )
+
+
+async def _run_non_interactive_http(
+    *,
+    message: str,
+    assistant_id: str,
+    model_name: str | None,
+    model_params: dict[str, Any] | None,
+    sandbox_type: str,
+    sandbox_id: str | None,
+    sandbox_setup: str | None,
+    quiet: bool,
+    stream: bool,
+    service_url: str | None,
+) -> int:
+    """Run one non-interactive task through HTTP service transport.
+
+    Returns:
+        Exit code: 0 for success, 1 for error, 130 for interrupt.
+    """
+    console = Console(stderr=True) if quiet else Console()
+
+    lease = acquire_service_lease(service_url)
+    transport = make_service_transport(lease.base_url)
+    await transport.initialize()
+
+    thread_id = generate_thread_id()
+    enable_shell = bool(settings.shell_allow_list)
+    auto_approve = not enable_shell
+
+    try:
+        session = await transport.new_session(
+            SessionCreateRequest(
+                assistant_id=assistant_id,
+                model_name=model_name,
+                model_params=model_params,
+                sandbox_type=sandbox_type,
+                sandbox_id=sandbox_id,
+                sandbox_setup=sandbox_setup,
+                auto_approve=auto_approve,
+                enable_shell=enable_shell,
+                thread_id=thread_id,
+                cwd=str(Path.cwd()),
+            )
+        )
+        thread_id = session.thread_id
+
+        if not quiet:
+            console.print("[dim]Running task non-interactively...[/dim]")
+            header = _build_non_interactive_header(assistant_id, thread_id)
+            console.print(header)
+            console.print()
+
+        full_response: list[str] = []
+        async for event in transport.prompt_stream(session.session_id, message):
+            event_type = event.event_type
+            payload = event.payload
+            if event_type == "text_delta":
+                text = str(payload.get("text", ""))
+                if text:
+                    if stream:
+                        _write_text(text)
+                    full_response.append(text)
+            elif event_type == "tool_call_started":
+                if not quiet:
+                    name = payload.get("name", "unknown")
+                    console.print(f"[dim]🔧 Calling tool: {name}[/dim]")
+            elif event_type == "approval_required":
+                action_requests = payload.get("action_requests", [])
+                if not isinstance(action_requests, list):
+                    action_requests = []
+                decisions = [
+                    _make_hitl_decision(cast("ActionRequest", request), console)
+                    for request in action_requests
+                    if isinstance(request, dict)
+                ]
+                permission_request_id = str(
+                    payload.get("permission_request_id")
+                    or payload.get("interrupt_id")
+                    or ""
+                )
+                if permission_request_id:
+                    await transport.submit_decision(
+                        session.session_id,
+                        permission_request_id,
+                        decisions,
+                    )
+            elif event_type == "error":
+                msg = str(payload.get("message", "unknown error"))
+                console.print(f"\n[red]Error: {msg}[/red]")
+                return 1
+            elif event_type == "done":
+                break
+
+        if full_response:
+            if not stream:
+                _write_text("".join(full_response))
+            _write_newline()
+
+        if not quiet:
+            console.print()
+            console.print("[green]✓ Task completed[/green]")
+
+        return 0  # noqa: TRY300
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted[/yellow]")
+        return 130
+    except Exception as e:
+        logger.exception("Unexpected error during HTTP non-interactive execution")
+        console.print(f"\n[red]Unexpected error ({type(e).__name__}): {e}[/red]")
+        return 1
+    finally:
+        release_service_lease(lease)

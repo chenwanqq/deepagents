@@ -78,6 +78,111 @@ class TestAppCSSValidation:
             assert app.is_running
 
 
+class TestHttpTransportPrewarm:
+    """Tests HTTP transport prewarm and transport display behavior."""
+
+    @pytest.mark.asyncio
+    async def test_http_on_mount_prewarms_service_transport(self) -> None:
+        """HTTP mode should prewarm service lease/transport on mount."""
+        app = DeepAgentsApp(transport="http")
+        lease = MagicMock(base_url="http://127.0.0.1:7777")
+        transport = MagicMock()
+        transport.initialize = AsyncMock()
+
+        with (
+            patch(
+                "deepagents_cli.service.manager.acquire_service_lease",
+                return_value=lease,
+            ) as mock_acquire,
+            patch(
+                "deepagents_cli.client.service_transport.make_service_transport",
+                return_value=transport,
+            ) as mock_make_transport,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                display = app.query_one("#transport-display", Static)
+                assert "HTTP:7777" in str(display.content)
+
+        mock_acquire.assert_called_once_with(None)
+        mock_make_transport.assert_called_once_with("http://127.0.0.1:7777")
+        transport.initialize.assert_awaited_once()
+        assert app._service_lease is lease
+        assert app._service_transport is transport
+
+    @pytest.mark.asyncio
+    async def test_inproc_on_mount_does_not_prewarm(self) -> None:
+        """In-process mode should not prewarm HTTP service transport."""
+        app = DeepAgentsApp(transport="inproc")
+
+        with (
+            patch(
+                "deepagents_cli.service.manager.acquire_service_lease"
+            ) as mock_acquire,
+            patch(
+                "deepagents_cli.client.service_transport.make_service_transport",
+            ) as mock_make_transport,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                display = app.query_one("#transport-display", Static)
+                assert "INPROC" in str(display.content)
+
+        mock_acquire.assert_not_called()
+        mock_make_transport.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_http_prewarm_failure_fails_fast(self) -> None:
+        """HTTP prewarm failures should fail app startup immediately."""
+        app = DeepAgentsApp(transport="http")
+
+        with (
+            patch(
+                "deepagents_cli.service.manager.acquire_service_lease",
+                side_effect=RuntimeError("boom"),
+            ),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+
+    @pytest.mark.asyncio
+    async def test_ensure_http_session_does_not_reacquire_when_prewarmed(self) -> None:
+        """Session creation should not reacquire lease once transport exists."""
+        app = DeepAgentsApp(transport="http")
+        app._session_state = TextualSessionState(thread_id="thread-abc")
+        app._service_transport = MagicMock()
+        app._service_transport.new_session = AsyncMock(
+            return_value=MagicMock(session_id="sid-1", thread_id="thread-xyz")
+        )
+
+        with patch(
+            "deepagents_cli.service.manager.acquire_service_lease"
+        ) as mock_acquire:
+            await app._ensure_http_session()
+
+        mock_acquire.assert_not_called()
+        app._service_transport.new_session.assert_awaited_once()
+        assert app._service_session_id == "sid-1"
+        assert app._session_state.thread_id == "thread-xyz"
+
+    def test_format_transport_display_inproc(self) -> None:
+        """In-process mode should display `INPROC`."""
+        app = DeepAgentsApp(transport="inproc")
+        assert app._format_transport_display() == "INPROC"
+
+    def test_format_transport_display_http_with_port(self) -> None:
+        """HTTP mode should include explicit port when available."""
+        app = DeepAgentsApp(transport="http")
+        app._service_lease = MagicMock(base_url="http://127.0.0.1:8123")
+        assert app._format_transport_display() == "HTTP:8123"
+
+    def test_format_transport_display_http_without_port(self) -> None:
+        """HTTP mode should omit port when URL has no explicit port."""
+        app = DeepAgentsApp(transport="http", service_url="https://example.com")
+        assert app._format_transport_display() == "HTTP"
+
+
 class TestAppBindings:
     """Test app keybindings."""
 

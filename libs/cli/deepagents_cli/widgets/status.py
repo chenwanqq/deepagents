@@ -92,6 +92,12 @@ class StatusBar(Horizontal):
         padding: 0 1;
         color: $text-muted;
     }
+
+    StatusBar .status-transport {
+        width: auto;
+        padding: 0 1;
+        color: $text-muted;
+    }
     """.replace("__MODE_BASH__", COLORS["mode_bash"]).replace(
         "__MODE_CMD__", COLORS["mode_command"]
     )
@@ -126,6 +132,7 @@ class StatusBar(Horizontal):
             id="auto-approve-indicator",
         )
         yield Static("", classes="status-message", id="status-message")
+        yield Static("", classes="status-transport", id="transport-display")
         yield Static("", classes="status-tokens", id="tokens-display")
         model_display = self._format_model_display()
         yield Static(model_display, classes="status-model", id="model-display")
@@ -277,3 +284,11 @@ class StatusBar(Horizontal):
                 `'anthropic:claude-sonnet-4-5'`).
         """
         self.query_one("#model-display", Static).update(model_spec)
+
+    def set_transport_display(self, value: str) -> None:
+        """Update the transport display text.
+
+        Args:
+            value: Transport display text (e.g., `'INPROC'` or `'HTTP:7777'`).
+        """
+        self.query_one("#transport-display", Static).update(value)

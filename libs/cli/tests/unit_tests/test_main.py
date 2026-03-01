@@ -1,8 +1,9 @@
 """Unit tests for main entry point."""
 
 import inspect
+from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -252,3 +253,137 @@ class TestFormatToolWarnings:
         """Unknown tools get a generic message."""
         assert format_tool_warning_tui("foo") == "foo is not installed."
         assert format_tool_warning_cli("foo") == "foo is not installed."
+
+
+class TestHttpServiceLeaseLifecycle:
+    """Tests for HTTP service lease release behavior."""
+
+    @pytest.mark.asyncio
+    async def test_run_textual_app_releases_http_service_lease(self) -> None:
+        """run_textual_app should release lease on normal exit."""
+
+        class FakeApp:
+            return_code = 0
+            _lc_thread_id = "tid"
+
+            def __init__(self, **_kwargs: object) -> None:
+                self._release_http_service = AsyncMock()
+
+            async def run_async(self) -> None:
+                return None
+
+        fake_app = FakeApp()
+        with patch("deepagents_cli.app.DeepAgentsApp", return_value=fake_app):
+            result = await run_textual_app(transport="http")
+
+        assert result.return_code == 0
+        fake_app._release_http_service.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_run_textual_app_releases_lease_on_error(self) -> None:
+        """run_textual_app should release lease when run_async raises."""
+
+        class FakeApp:
+            return_code = 1
+            _lc_thread_id = "tid"
+
+            def __init__(self, **_kwargs: object) -> None:
+                self._release_http_service = AsyncMock()
+
+            async def run_async(self) -> None:
+                msg = "boom"
+                raise RuntimeError(msg)
+
+        fake_app = FakeApp()
+        with (
+            patch("deepagents_cli.app.DeepAgentsApp", return_value=fake_app),
+            pytest.raises(RuntimeError),
+        ):
+            await run_textual_app(transport="http")
+
+        fake_app._release_http_service.assert_awaited_once()
+
+    def test_cli_main_threads_list_http_releases_lease(self) -> None:
+        """Threads list over HTTP should release acquired lease."""
+        from deepagents_cli.main import cli_main
+
+        lease = MagicMock(base_url="http://127.0.0.1:9000")
+        transport = MagicMock()
+        transport.list_threads = AsyncMock(return_value=[])
+
+        args = Namespace(
+            shell_allow_list=None,
+            model_params=None,
+            quiet=False,
+            no_stream=False,
+            clear_default_model=False,
+            default_model=None,
+            command="threads",
+            threads_command="list",
+            transport="http",
+            service_url=None,
+            agent=None,
+            limit=None,
+        )
+
+        with (
+            patch("deepagents_cli.main.check_cli_dependencies"),
+            patch("deepagents_cli.main.parse_args", return_value=args),
+            patch("deepagents_cli.main.apply_stdin_pipe"),
+            patch("deepagents_cli.main.check_optional_tools", return_value=[]),
+            patch(
+                "deepagents_cli.service.manager.acquire_service_lease",
+                return_value=lease,
+            ),
+            patch(
+                "deepagents_cli.service.manager.release_service_lease",
+            ) as mock_release,
+            patch(
+                "deepagents_cli.client.service_transport.make_service_transport",
+                return_value=transport,
+            ),
+        ):
+            cli_main()
+
+        mock_release.assert_called_once_with(lease)
+
+    def test_cli_main_agents_list_http_releases_lease(self) -> None:
+        """Agents list over HTTP should release acquired lease."""
+        from deepagents_cli.main import cli_main
+
+        lease = MagicMock(base_url="http://127.0.0.1:9000")
+        transport = MagicMock()
+        transport.list_agents = AsyncMock(return_value=[])
+
+        args = Namespace(
+            shell_allow_list=None,
+            model_params=None,
+            quiet=False,
+            no_stream=False,
+            clear_default_model=False,
+            default_model=None,
+            command="list",
+            transport="http",
+            service_url=None,
+        )
+
+        with (
+            patch("deepagents_cli.main.check_cli_dependencies"),
+            patch("deepagents_cli.main.parse_args", return_value=args),
+            patch("deepagents_cli.main.apply_stdin_pipe"),
+            patch("deepagents_cli.main.check_optional_tools", return_value=[]),
+            patch(
+                "deepagents_cli.service.manager.acquire_service_lease",
+                return_value=lease,
+            ),
+            patch(
+                "deepagents_cli.service.manager.release_service_lease",
+            ) as mock_release,
+            patch(
+                "deepagents_cli.client.service_transport.make_service_transport",
+                return_value=transport,
+            ),
+        ):
+            cli_main()
+
+        mock_release.assert_called_once_with(lease)

@@ -21,7 +21,7 @@ import sys
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from deepagents_cli.app import AppResult
@@ -390,6 +390,25 @@ def parse_args() -> argparse.Namespace:
         help="Path to setup script to run in sandbox after creation",
     )
     parser.add_argument(
+        "--transport",
+        choices=["inproc", "http"],
+        default=os.environ.get("DEEPAGENTS_CLI_TRANSPORT", "inproc"),
+        metavar="MODE",
+        help=(
+            "Execution transport: 'inproc' runs agent in-process (default), "
+            "'http' routes through local/remote FastAPI service"
+        ),
+    )
+    parser.add_argument(
+        "--service-url",
+        default=os.environ.get("DEEPAGENTS_CLI_SERVICE_URL"),
+        metavar="URL",
+        help=(
+            "Service base URL for --transport http. If omitted, CLI auto-starts "
+            "a local service."
+        ),
+    )
+    parser.add_argument(
         "--shell-allow-list",
         metavar="LIST",
         help="Comma-separated list of shell commands to auto-approve, "
@@ -437,6 +456,8 @@ async def run_textual_cli_async(
     thread_id: str | None = None,
     is_resumed: bool = False,
     initial_prompt: str | None = None,
+    transport: str = "inproc",
+    service_url: str | None = None,
 ) -> "AppResult":
     """Run the Textual CLI interface (async version).
 
@@ -455,17 +476,17 @@ async def run_textual_cli_async(
         thread_id: Thread ID to use (new or resumed)
         is_resumed: Whether this is a resumed session
         initial_prompt: Optional prompt to auto-submit when session starts
+        transport: Runtime transport (`inproc` or `http`).
+        service_url: Optional service URL for HTTP transport.
 
     Returns:
         An `AppResult` with the return code and final thread ID.
     """
     from rich.text import Text
 
-    from deepagents_cli.agent import create_cli_agent
     from deepagents_cli.app import run_textual_app
     from deepagents_cli.config import console, create_model, settings
     from deepagents_cli.model_config import ModelConfigError
-    from deepagents_cli.sessions import get_checkpointer
     from deepagents_cli.tools import fetch_url, http_request, web_search
 
     try:
@@ -488,6 +509,34 @@ async def run_textual_cli_async(
         msg = Text("Starting with thread: ", style="dim")
         msg.append(str(thread_id), style="dim")
         console.print(msg)
+
+    if transport == "http":
+        from deepagents_cli.app import AppResult
+
+        try:
+            return await run_textual_app(
+                agent=None,
+                assistant_id=assistant_id,
+                backend=None,
+                auto_approve=auto_approve,
+                cwd=Path.cwd(),
+                thread_id=thread_id,
+                initial_prompt=initial_prompt,
+                checkpointer=None,
+                tools=None,
+                sandbox=None,
+                sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                transport=transport,
+                service_url=service_url,
+                model_name=model_name,
+                model_params=model_params,
+            )
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[bold red]Error:[/bold red] {e}")
+            return AppResult(return_code=1, thread_id=thread_id)
+
+    from deepagents_cli.agent import create_cli_agent
+    from deepagents_cli.sessions import get_checkpointer
 
     # Use async context manager for checkpointer
     async with get_checkpointer() as checkpointer:
@@ -557,6 +606,10 @@ async def run_textual_cli_async(
                 tools=tools,
                 sandbox=sandbox_backend,
                 sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                transport=transport,
+                service_url=service_url,
+                model_name=model_name,
+                model_params=model_params,
             )
         finally:
             # Clean up sandbox after app exits (success or error)
@@ -817,17 +870,170 @@ def cli_main() -> None:
 
             show_help()
         elif args.command == "list":
-            from deepagents_cli.agent import list_agents
+            if args.transport == "http":
+                from deepagents_cli.client.service_transport import (
+                    make_service_transport,
+                )
+                from deepagents_cli.service.manager import (
+                    acquire_service_lease,
+                    release_service_lease,
+                )
 
-            list_agents()
+                lease = acquire_service_lease(args.service_url)
+                try:
+                    transport = make_service_transport(lease.base_url)
+                    agents = asyncio.run(transport.list_agents())
+                finally:
+                    release_service_lease(lease)
+
+                if not agents:
+                    console.print("[yellow]No agents found.[/yellow]")
+                else:
+                    console.print("\n[bold]Available Agents:[/bold]\n")
+                    for agent in agents:
+                        name = str(agent.get("name", ""))
+                        is_default = bool(agent.get("isDefault"))
+                        has_md = bool(agent.get("hasAgentsMd"))
+                        suffix = " [dim](default)[/dim]" if is_default else ""
+                        state = "" if has_md else " [dim](incomplete)[/dim]"
+                        console.print(f"  - [bold]{name}[/bold]{suffix}{state}")
+                        console.print(f"    {agent.get('path', '')}", style="dim")
+                    console.print()
+            else:
+                from deepagents_cli.agent import list_agents
+
+                list_agents()
         elif args.command == "reset":
-            from deepagents_cli.agent import reset_agent
+            if args.transport == "http":
+                from deepagents_cli.client.service_transport import (
+                    make_service_transport,
+                )
+                from deepagents_cli.service.manager import (
+                    acquire_service_lease,
+                    release_service_lease,
+                )
 
-            reset_agent(args.agent, args.source_agent)
+                lease = acquire_service_lease(args.service_url)
+                try:
+                    transport = make_service_transport(lease.base_url)
+                    result = asyncio.run(
+                        transport.reset_agent(
+                            agent_name=args.agent,
+                            source_agent=args.source_agent,
+                        )
+                    )
+                finally:
+                    release_service_lease(lease)
+
+                console.print(
+                    f"[green]Agent '{result.get('agent', args.agent)}' reset.[/green]"
+                )
+                console.print(f"[dim]{result.get('path', '')}[/dim]")
+            else:
+                from deepagents_cli.agent import reset_agent
+
+                reset_agent(args.agent, args.source_agent)
         elif args.command == "skills":
-            from deepagents_cli.skills import execute_skills_command
+            if args.transport == "http":
+                from deepagents_cli.client.service_transport import (
+                    make_service_transport,
+                )
+                from deepagents_cli.service.manager import (
+                    acquire_service_lease,
+                    release_service_lease,
+                )
+                from deepagents_cli.ui import show_skills_help
 
-            execute_skills_command(args)
+                lease = acquire_service_lease(args.service_url)
+                try:
+                    transport = make_service_transport(lease.base_url)
+                    if args.skills_command in {"list", "ls"}:
+                        skills = asyncio.run(
+                            transport.list_skills(
+                                agent=args.agent,
+                                project=bool(args.project),
+                            )
+                        )
+                        if not skills:
+                            console.print("[yellow]No skills found.[/yellow]")
+                        else:
+                            console.print("\n[bold]Skills:[/bold]\n")
+                            for skill in skills:
+                                name = str(skill.get("name", ""))
+                                source = str(skill.get("source", "unknown"))
+                                desc = str(skill.get("description", ""))
+                                console.print(
+                                    f"  - [bold]{name}[/bold] [dim]({source})[/dim]"
+                                )
+                                if desc:
+                                    console.print(f"    {desc}", style="dim")
+                    elif args.skills_command == "create":
+                        result = asyncio.run(
+                            transport.create_skill(
+                                name=args.name,
+                                agent=args.agent,
+                                project=bool(args.project),
+                            )
+                        )
+                        created_name = str(result.get("name", args.name))
+                        console.print(
+                            f"[green]Skill '{created_name}' created.[/green]"
+                        )
+                        console.print(f"[dim]{result.get('path', '')}[/dim]")
+                    elif args.skills_command == "info":
+                        result = asyncio.run(
+                            transport.skill_info(
+                                name=args.name,
+                                agent=args.agent,
+                                project=bool(args.project),
+                            )
+                        )
+                        skill = result.get("skill", {})
+                        if not isinstance(skill, dict):
+                            skill = {}
+                        skill_name = str(skill.get("name", args.name))
+                        console.print(f"\n[bold]Skill:[/bold] {skill_name}")
+                        console.print(
+                            f"[bold]Source:[/bold] {skill.get('source', 'unknown')}",
+                            style="dim",
+                        )
+                        console.print(
+                            f"[bold]Path:[/bold] {skill.get('path', '')}",
+                            style="dim",
+                        )
+                        desc = str(skill.get("description", ""))
+                        if desc:
+                            console.print(
+                                f"[bold]Description:[/bold] {desc}",
+                                style="dim",
+                            )
+                        supporting = result.get("supportingFiles", [])
+                        if isinstance(supporting, list) and supporting:
+                            console.print("[bold]Supporting Files:[/bold]", style="dim")
+                            for item in supporting:
+                                console.print(f"  - {item}", style="dim")
+                        content = str(result.get("content", ""))
+                        if content:
+                            console.print("\n[bold]SKILL.md:[/bold]\n", style="dim")
+                            console.print(content, style="dim")
+                    elif args.skills_command == "delete":
+                        asyncio.run(
+                            transport.delete_skill(
+                                name=args.name,
+                                agent=args.agent,
+                                project=bool(args.project),
+                                force=bool(args.force),
+                            )
+                        )
+                        console.print(f"[green]Skill '{args.name}' deleted.[/green]")
+                    else:
+                        show_skills_help()
+                finally:
+                    release_service_lease(lease)
+            else:
+                from deepagents_cli.skills import execute_skills_command
+
+                execute_skills_command(args)
         elif args.command == "threads":
             from deepagents_cli.sessions import (
                 delete_thread_command,
@@ -838,14 +1044,90 @@ def cli_main() -> None:
             # "ls" is an argparse alias for "list" — argparse stores the
             # alias as-is in the namespace, so we must match both values.
             if args.threads_command in {"list", "ls"}:
-                asyncio.run(
-                    list_threads_command(
-                        agent_name=getattr(args, "agent", None),
-                        limit=getattr(args, "limit", None),
+                if args.transport == "http":
+                    from rich.table import Table
+
+                    from deepagents_cli.client.service_transport import (
+                        make_service_transport,
                     )
-                )
+                    from deepagents_cli.service.manager import (
+                        acquire_service_lease,
+                        release_service_lease,
+                    )
+                    from deepagents_cli.sessions import (
+                        format_timestamp,
+                        get_thread_limit,
+                    )
+
+                    limit = (
+                        get_thread_limit()
+                        if args.limit is None
+                        else max(1, int(args.limit))
+                    )
+                    lease = acquire_service_lease(args.service_url)
+                    try:
+                        transport = make_service_transport(lease.base_url)
+                        threads = asyncio.run(
+                            transport.list_threads(
+                                agent_name=getattr(args, "agent", None),
+                                limit=limit,
+                                include_message_count=True,
+                            )
+                        )
+                        if not threads:
+                            console.print("[yellow]No threads found.[/yellow]")
+                            console.print(
+                                "[dim]Start a conversation with: deepagents[/dim]"
+                            )
+                        else:
+                            title = f"Recent Threads (last {limit})"
+                            table = Table(title=title, show_header=True)
+                            table.add_column("Thread ID", style="bold")
+                            table.add_column("Agent")
+                            table.add_column("Messages", justify="right")
+                            table.add_column("Last Used", style="dim")
+                            for thread in threads:
+                                table.add_row(
+                                    str(thread.get("thread_id", "")),
+                                    str(thread.get("agent_name") or "unknown"),
+                                    str(thread.get("message_count") or 0),
+                                    format_timestamp(
+                                        cast("str | None", thread.get("updated_at"))
+                                    ),
+                                )
+                            console.print()
+                            console.print(table)
+                            console.print()
+                    finally:
+                        release_service_lease(lease)
+                else:
+                    asyncio.run(
+                        list_threads_command(
+                            agent_name=getattr(args, "agent", None),
+                            limit=getattr(args, "limit", None),
+                        )
+                    )
             elif args.threads_command == "delete":
-                asyncio.run(delete_thread_command(args.thread_id))
+                if args.transport == "http":
+                    from deepagents_cli.client.service_transport import (
+                        make_service_transport,
+                    )
+                    from deepagents_cli.service.manager import (
+                        acquire_service_lease,
+                        release_service_lease,
+                    )
+
+                    lease = acquire_service_lease(args.service_url)
+                    try:
+                        transport = make_service_transport(lease.base_url)
+                        asyncio.run(transport.delete_thread(args.thread_id))
+                        console.print(
+                            f"[green]Thread '{args.thread_id}' deleted.[/green]"
+                        )
+                    finally:
+                        release_service_lease(lease)
+                else:
+                    asyncio.run(delete_thread_command(args.thread_id))
             else:
                 # No subcommand provided, show threads help screen
                 show_threads_help()
@@ -880,6 +1162,8 @@ def cli_main() -> None:
                     sandbox_type=args.sandbox,
                     sandbox_id=args.sandbox_id,
                     sandbox_setup=getattr(args, "sandbox_setup", None),
+                    transport=args.transport,
+                    service_url=args.service_url,
                     quiet=args.quiet,
                     stream=not args.no_stream,
                 )
@@ -979,6 +1263,8 @@ def cli_main() -> None:
                         thread_id=thread_id,
                         is_resumed=is_resumed,
                         initial_prompt=getattr(args, "initial_prompt", None),
+                        transport=args.transport,
+                        service_url=args.service_url,
                     )
                 )
                 return_code = result.return_code

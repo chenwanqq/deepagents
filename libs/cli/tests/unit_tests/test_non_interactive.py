@@ -588,6 +588,122 @@ class TestNoStreamMode:
         assert text_writes[1] == "world"
 
 
+class TestHttpTransport:
+    """Tests for HTTP transport path in non-interactive mode."""
+
+    @pytest.mark.asyncio
+    async def test_http_transport_path(self) -> None:
+        """`transport=http` should route through service transport."""
+        mock_transport = MagicMock()
+        mock_transport.initialize = AsyncMock()
+        mock_transport.new_session = AsyncMock(
+            return_value=MagicMock(session_id="sid", thread_id="tid")
+        )
+        mock_transport.submit_decision = AsyncMock()
+
+        async def _events(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202, RUF029
+            yield MagicMock(event_id=1, event_type="text_delta", payload={"text": "ok"})
+            yield MagicMock(event_id=2, event_type="done", payload={"final": True})
+
+        mock_transport.prompt_stream = _events
+
+        with (
+            patch(
+                "deepagents_cli.non_interactive.create_model",
+                return_value=ModelResult(
+                    model=MagicMock(),
+                    model_name="test-model",
+                    provider="test",
+                ),
+            ),
+            patch(
+                "deepagents_cli.non_interactive.make_service_transport",
+                return_value=mock_transport,
+            ),
+            patch(
+                "deepagents_cli.non_interactive.acquire_service_lease",
+                return_value=MagicMock(base_url="http://127.0.0.1:9000"),
+            ),
+            patch(
+                "deepagents_cli.non_interactive.release_service_lease",
+            ) as mock_release,
+            patch(
+                "deepagents_cli.non_interactive.generate_thread_id",
+                return_value="test-thread",
+            ),
+            patch(
+                "deepagents_cli.non_interactive.settings",
+            ) as mock_settings,
+        ):
+            mock_settings.shell_allow_list = None
+            mock_settings.model_name = None
+            code = await run_non_interactive(
+                message="hello",
+                transport="http",
+                quiet=True,
+            )
+
+        assert code == 0
+        mock_transport.initialize.assert_awaited_once()
+        mock_transport.new_session.assert_awaited_once()
+        mock_release.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_http_transport_releases_lease_on_error(self) -> None:
+        """HTTP transport should release lease even when execution fails."""
+        mock_transport = MagicMock()
+        mock_transport.initialize = AsyncMock()
+        mock_transport.new_session = AsyncMock(
+            return_value=MagicMock(session_id="sid", thread_id="tid")
+        )
+
+        async def _events_error(*_args, **_kwargs):  # noqa: ANN002, ANN003, ANN202, RUF029
+            msg = "boom"
+            raise RuntimeError(msg)
+            yield  # pragma: no cover
+
+        mock_transport.prompt_stream = _events_error
+
+        with (
+            patch(
+                "deepagents_cli.non_interactive.create_model",
+                return_value=ModelResult(
+                    model=MagicMock(),
+                    model_name="test-model",
+                    provider="test",
+                ),
+            ),
+            patch(
+                "deepagents_cli.non_interactive.make_service_transport",
+                return_value=mock_transport,
+            ),
+            patch(
+                "deepagents_cli.non_interactive.acquire_service_lease",
+                return_value=MagicMock(base_url="http://127.0.0.1:9000"),
+            ),
+            patch(
+                "deepagents_cli.non_interactive.release_service_lease",
+            ) as mock_release,
+            patch(
+                "deepagents_cli.non_interactive.generate_thread_id",
+                return_value="test-thread",
+            ),
+            patch(
+                "deepagents_cli.non_interactive.settings",
+            ) as mock_settings,
+        ):
+            mock_settings.shell_allow_list = None
+            mock_settings.model_name = None
+            code = await run_non_interactive(
+                message="hello",
+                transport="http",
+                quiet=True,
+            )
+
+        assert code == 1
+        mock_release.assert_called_once()
+
+
 async def _async_iter(items: list[object]) -> AsyncIterator[object]:  # noqa: RUF029
     """Create an async iterator from a list for testing."""
     for item in items:

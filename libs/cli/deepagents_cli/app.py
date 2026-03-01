@@ -15,6 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from urllib.parse import urlparse
 
 from rich.text import Text
 from textual.app import App
@@ -36,6 +37,7 @@ from deepagents_cli.config import (
     is_shell_command_allowed,
     settings,
 )
+from deepagents_cli.core.contracts import SessionCreateRequest
 from deepagents_cli.model_config import ModelSpec, save_recent_model
 from deepagents_cli.textual_adapter import TextualUIAdapter, execute_task_textual
 from deepagents_cli.widgets.approval import ApprovalMenu
@@ -50,6 +52,7 @@ from deepagents_cli.widgets.message_store import (
 from deepagents_cli.widgets.messages import (
     AppMessage,
     AssistantMessage,
+    DiffMessage,
     ErrorMessage,
     QueuedUserMessage,
     ToolCallMessage,
@@ -76,6 +79,8 @@ if TYPE_CHECKING:
     from textual.scrollbar import ScrollUp
     from textual.widget import Widget
     from textual.worker import Worker
+
+    from deepagents_cli.service.manager import LocalServiceLease
 
 # iTerm2 Cursor Guide Workaround
 # ===============================
@@ -416,6 +421,10 @@ class DeepAgentsApp(App):
         tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
         sandbox: SandboxBackendProtocol | None = None,
         sandbox_type: str | None = None,
+        transport: str = "inproc",
+        service_url: str | None = None,
+        model_name: str | None = None,
+        model_params: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the Deep Agents application.
@@ -432,6 +441,10 @@ class DeepAgentsApp(App):
             tools: Tools used to create the agent (for model hot-swap)
             sandbox: Sandbox backend (for model hot-swap)
             sandbox_type: Type of sandbox provider (for model hot-swap)
+            transport: Runtime transport (`"inproc"` or `"http"`).
+            service_url: Optional service URL for HTTP mode.
+            model_name: Model override used to create HTTP session.
+            model_params: Extra model kwargs used to create HTTP session.
             **kwargs: Additional arguments passed to parent
         """
         super().__init__(**kwargs)
@@ -448,6 +461,13 @@ class DeepAgentsApp(App):
         self._tools = tools or []
         self._sandbox = sandbox
         self._sandbox_type = sandbox_type
+        self._transport = transport
+        self._service_url = service_url
+        self._model_name = model_name
+        self._model_params = model_params
+        self._service_transport: Any = None
+        self._service_lease: LocalServiceLease | None = None
+        self._service_session_id: str | None = None
         self._status_bar: StatusBar | None = None
         self._chat_input: ChatInput | None = None
         self._quit_pending = False
@@ -517,19 +537,23 @@ class DeepAgentsApp(App):
             self._update_tokens, self._hide_tokens
         )
 
-        # Create UI adapter if agent is provided
-        if self._agent:
-            self._ui_adapter = TextualUIAdapter(
-                mount_message=self._mount_message,
-                update_status=self._update_status,
-                request_approval=self._request_approval,
-                on_auto_approve_enabled=self._on_auto_approve_enabled,
-                scroll_to_bottom=self._scroll_chat_to_bottom,
-                set_spinner=self._set_spinner,
-                set_active_message=self._set_active_message,
-                sync_message_content=self._sync_message_content,
-            )
-            self._ui_adapter.set_token_tracker(self._token_tracker)
+        # Create UI adapter for both in-process and HTTP transport modes
+        self._ui_adapter = TextualUIAdapter(
+            mount_message=self._mount_message,
+            update_status=self._update_status,
+            request_approval=self._request_approval,
+            on_auto_approve_enabled=self._on_auto_approve_enabled,
+            scroll_to_bottom=self._scroll_chat_to_bottom,
+            set_spinner=self._set_spinner,
+            set_active_message=self._set_active_message,
+            sync_message_content=self._sync_message_content,
+        )
+        self._ui_adapter.set_token_tracker(self._token_tracker)
+        self._update_transport_display()
+
+        # In HTTP mode, prewarm service transport on startup so failures are
+        # surfaced immediately and transport status can show the bound port.
+        await self._prewarm_http_transport()
 
         # Focus the input (autocomplete is now built into ChatInput)
         self._chat_input.focus_input()
@@ -571,10 +595,13 @@ class DeepAgentsApp(App):
                 lambda: asyncio.create_task(self._handle_user_message(prompt))
             )
         # Load thread history if resuming a session (no initial prompt)
-        elif self._lc_thread_id and self._agent:
-            self.call_after_refresh(
-                lambda: asyncio.create_task(self._load_thread_history())
+        elif self._lc_thread_id and (self._agent or self._transport == "http"):
+            loader = (
+                self._load_thread_history_http
+                if self._transport == "http"
+                else self._load_thread_history
             )
+            self.call_after_refresh(lambda: asyncio.create_task(loader()))
 
     def on_resize(self, _event: Resize) -> None:
         """Handle terminal resize to recalculate layout."""
@@ -593,6 +620,45 @@ class DeepAgentsApp(App):
         """Update the status bar with a message."""
         if self._status_bar:
             self._status_bar.set_status_message(message)
+
+    @staticmethod
+    def _extract_port(value: str | None) -> int | None:
+        """Extract explicit port from a URL.
+
+        Args:
+            value: URL string to parse.
+
+        Returns:
+            Parsed port if present, otherwise `None`.
+        """
+        if not value:
+            return None
+        try:
+            return urlparse(value).port
+        except ValueError:
+            return None
+
+    def _format_transport_display(self) -> str:
+        """Build short transport status text for the status bar.
+
+        Returns:
+            Transport status text (e.g. `INPROC`, `HTTP`, `HTTP:7777`).
+        """
+        if self._transport != "http":
+            return "INPROC"
+
+        service_base = (
+            self._service_lease.base_url if self._service_lease else self._service_url
+        )
+        port = self._extract_port(service_base)
+        if port is None:
+            return "HTTP"
+        return f"HTTP:{port}"
+
+    def _update_transport_display(self) -> None:
+        """Refresh transport status in the status bar."""
+        if self._status_bar:
+            self._status_bar.set_transport_display(self._format_transport_display())
 
     def _update_tokens(self, count: int) -> None:
         """Update the token count in status bar."""
@@ -1303,6 +1369,41 @@ class DeepAgentsApp(App):
         `max_input_tokens`). Until that threshold is exceeded the user sees
         "Nothing to compact yet".
         """
+        if self._transport == "http":
+            try:
+                await self._ensure_http_session()
+                if self._service_transport is None or self._service_session_id is None:
+                    await self._mount_message(
+                        AppMessage("Nothing to compact — start a conversation first")
+                    )
+                    return
+                result = await self._service_transport.compact_session(
+                    self._service_session_id
+                )
+            except Exception as exc:  # noqa: BLE001
+                await self._mount_message(ErrorMessage(f"Compaction failed: {exc}"))
+                return
+
+            compacted = int(result.get("compactedMessages", 0))
+            if compacted <= 0:
+                await self._mount_message(
+                    AppMessage(
+                        "Nothing to compact yet"
+                        " — conversation is within the token budget"
+                    )
+                )
+                return
+            tokens_before = int(result.get("tokensBefore", 0))
+            tokens_after = int(result.get("tokensAfter", 0))
+            await self._mount_message(
+                AppMessage(
+                    "Compacted "
+                    f"{compacted} messages ({tokens_before} -> "
+                    f"{tokens_after} tokens)"
+                )
+            )
+            return
+
         if not self._agent or not self._lc_thread_id or not self._backend:
             await self._mount_message(
                 AppMessage("Nothing to compact \u2014 start a conversation first")
@@ -1570,7 +1671,8 @@ class DeepAgentsApp(App):
             pass
 
         # Check if agent is available
-        if self._agent and self._ui_adapter and self._session_state:
+        has_runtime = (self._agent is not None) or self._transport == "http"
+        if has_runtime and self._ui_adapter and self._session_state:
             self._agent_running = True
 
             if self._chat_input:
@@ -1595,19 +1697,22 @@ class DeepAgentsApp(App):
 
         This runs in a worker thread so the main event loop stays responsive.
         """
-        # Caller ensures _ui_adapter is set (checked in _handle_user_message)
-        if self._ui_adapter is None:
-            return
         try:
-            await execute_task_textual(
-                user_input=message,
-                agent=self._agent,
-                assistant_id=self._assistant_id,
-                session_state=self._session_state,
-                adapter=self._ui_adapter,
-                backend=self._backend,
-                image_tracker=self._image_tracker,
-            )
+            if self._transport == "http":
+                await self._run_agent_task_http(message)
+            else:
+                # Caller ensures _ui_adapter is set (checked in _handle_user_message)
+                if self._ui_adapter is None:
+                    return
+                await execute_task_textual(
+                    user_input=message,
+                    agent=self._agent,
+                    assistant_id=self._assistant_id,
+                    session_state=self._session_state,
+                    adapter=self._ui_adapter,
+                    backend=self._backend,
+                    image_tracker=self._image_tracker,
+                )
         except Exception as e:  # noqa: BLE001  # Resilient tool rendering
             # Ensure any in-flight tool calls don't remain stuck in "Running..."
             # when streaming aborts before tool results arrive.
@@ -1617,6 +1722,228 @@ class DeepAgentsApp(App):
         finally:
             # Clean up loading widget and agent state
             await self._cleanup_agent_task()
+
+    async def _ensure_http_session(self) -> None:
+        """Initialize service transport and create a runtime session if needed.
+
+        Raises:
+            RuntimeError: If session state is not available.
+        """
+        await self._prewarm_http_transport()
+        if self._service_transport is None:
+            msg = "HTTP transport is not initialized"
+            raise RuntimeError(msg)
+
+        if self._service_session_id is None:
+            await self._create_http_session()
+
+    async def _create_http_session(self, *, thread_id: str | None = None) -> None:
+        """Create one runtime session on HTTP transport and persist identifiers.
+
+        Raises:
+            RuntimeError: If HTTP transport or session state is not initialized.
+        """
+        await self._prewarm_http_transport()
+        if self._service_transport is None:
+            msg = "HTTP transport is not initialized"
+            raise RuntimeError(msg)
+        if self._session_state is None:
+            msg = "Session state is not initialized"
+            raise RuntimeError(msg)
+
+        handle = await self._service_transport.new_session(
+            SessionCreateRequest(
+                assistant_id=self._assistant_id or "agent",
+                model_name=self._model_name,
+                model_params=self._model_params,
+                sandbox_type=self._sandbox_type or "none",
+                auto_approve=self._session_state.auto_approve,
+                enable_shell=True,
+                thread_id=thread_id or self._session_state.thread_id,
+                cwd=self._cwd,
+            )
+        )
+        self._service_session_id = handle.session_id
+        self._lc_thread_id = handle.thread_id
+        self._session_state.thread_id = handle.thread_id
+
+    async def _prewarm_http_transport(self) -> None:
+        """Initialize HTTP lease and transport at app startup."""
+        if self._transport != "http":
+            return
+        if self._service_transport is not None:
+            return
+
+        from deepagents_cli.client.service_transport import make_service_transport
+        from deepagents_cli.service.manager import acquire_service_lease
+
+        self._service_lease = acquire_service_lease(self._service_url)
+        self._service_transport = make_service_transport(self._service_lease.base_url)
+        await self._service_transport.initialize()
+        self._update_transport_display()
+
+    async def _release_http_service(self) -> None:
+        """Release managed HTTP service lease, if any."""
+        if self._service_lease is None:
+            return
+        from deepagents_cli.service.manager import release_service_lease
+
+        try:
+            release_service_lease(self._service_lease)
+        except Exception:
+            logger.warning("Failed to release HTTP service lease", exc_info=True)
+        finally:
+            self._service_lease = None
+
+    async def _run_agent_task_http(self, message: str) -> None:
+        """Run an agent task through HTTP transport and render existing widgets.
+
+        Raises:
+            RuntimeError: If HTTP transport or session state is unavailable.
+        """
+        await self._ensure_http_session()
+        if self._service_transport is None or self._service_session_id is None:
+            msg = "HTTP transport is not initialized"
+            raise RuntimeError(msg)
+        if self._session_state is None:
+            msg = "Session state is not initialized"
+            raise RuntimeError(msg)
+
+        if self._token_tracker:
+            self._token_tracker.hide()
+        await self._set_spinner("Thinking")
+
+        assistant_message: AssistantMessage | None = None
+        current_tool_messages: dict[str, ToolCallMessage] = {}
+
+        async for event in self._service_transport.prompt_stream(
+            self._service_session_id,
+            message,
+        ):
+            payload = event.payload
+            event_type = event.event_type
+
+            if event_type == "text_delta":
+                text = str(payload.get("text", ""))
+                if not text:
+                    continue
+                if assistant_message is None:
+                    await self._set_spinner(None)
+                    assistant_message = AssistantMessage("")
+                    await self._mount_message(assistant_message)
+                await assistant_message.append_content(text)
+                self._scroll_chat_to_bottom()
+                continue
+
+            if event_type == "tool_call_started":
+                tool_call_id = str(payload.get("tool_call_id", ""))
+                tool_name = str(payload.get("name", "unknown"))
+                args = payload.get("args", {})
+                if assistant_message is not None:
+                    await assistant_message.stop_stream()
+                    assistant_message = None
+                await self._set_spinner(None)
+                parsed_args = args if isinstance(args, dict) else {}
+                tool_msg = ToolCallMessage(tool_name, parsed_args)
+                await self._mount_message(tool_msg)
+                if tool_call_id:
+                    current_tool_messages[tool_call_id] = tool_msg
+                self._scroll_chat_to_bottom()
+                continue
+
+            if event_type == "tool_call_finished":
+                tool_call_id = str(payload.get("tool_call_id", ""))
+                status = str(payload.get("status", "success"))
+                output = str(payload.get("output", ""))
+                diff = payload.get("diff")
+
+                if tool_call_id and tool_call_id in current_tool_messages:
+                    tool_msg = current_tool_messages[tool_call_id]
+                    if status == "success":
+                        tool_msg.set_success(output)
+                    elif status == "error":
+                        tool_msg.set_error(output or "Error")
+                    else:
+                        tool_msg.set_rejected()
+                    current_tool_messages.pop(tool_call_id, None)
+
+                if isinstance(diff, str) and diff:
+                    await self._mount_message(DiffMessage(diff))
+                await self._set_spinner("Thinking")
+                continue
+
+            if event_type == "approval_required":
+                action_requests = payload.get("action_requests", [])
+                if not isinstance(action_requests, list):
+                    action_requests = []
+
+                if self._session_state.auto_approve:
+                    decisions = [{"type": "approve"} for _ in action_requests]
+                    for tool_msg in list(current_tool_messages.values()):
+                        tool_msg.set_running()
+                else:
+                    decision_future = await self._request_approval(
+                        action_requests,
+                        self._assistant_id,
+                    )
+                    decision_result = await decision_future
+                    decision_type = decision_result.get("type")
+
+                    if decision_type == "auto_approve_all":
+                        self._session_state.auto_approve = True
+                        self._on_auto_approve_enabled()
+                        decisions = [
+                            {"type": "approve", "message": "allow-always"}
+                            for _ in action_requests
+                        ]
+                        for tool_msg in list(current_tool_messages.values()):
+                            tool_msg.set_running()
+                    elif decision_type == "approve":
+                        decisions = [{"type": "approve"} for _ in action_requests]
+                        for tool_msg in list(current_tool_messages.values()):
+                            tool_msg.set_running()
+                    elif decision_type == "reject":
+                        message_text = decision_result.get("message")
+                        decisions = [
+                            {"type": "reject", "message": message_text}
+                            for _ in action_requests
+                        ]
+                        for tool_msg in list(current_tool_messages.values()):
+                            tool_msg.set_rejected()
+                        current_tool_messages.clear()
+                    else:
+                        decisions = [{"type": "reject", "message": "Unknown decision"}]
+
+                permission_request_id = str(
+                    payload.get("permission_request_id")
+                    or payload.get("interrupt_id")
+                    or ""
+                )
+                if permission_request_id:
+                    await self._service_transport.submit_decision(
+                        self._service_session_id,
+                        permission_request_id,
+                        decisions,
+                    )
+                continue
+
+            if event_type == "token_usage":
+                if self._token_tracker:
+                    total_tokens = int(payload.get("total_tokens", 0))
+                    if total_tokens > 0:
+                        self._token_tracker.add(total_tokens)
+                continue
+
+            if event_type == "error":
+                msg = str(payload.get("message", "Unknown error"))
+                await self._mount_message(ErrorMessage(msg))
+                continue
+
+            if event_type == "done":
+                break
+
+        if assistant_message is not None:
+            await assistant_message.stop_stream()
 
     async def _process_next_from_queue(self) -> None:
         """Process the next message from the queue if any exist.
@@ -1834,6 +2161,96 @@ class DeepAgentsApp(App):
         except Exception as e:  # Resilient history loading
             logger.exception("Failed to load thread history for %s", self._lc_thread_id)
             await self._mount_message(AppMessage(f"Could not load history: {e}"))
+
+    async def _load_thread_history_http(self) -> None:
+        """Load and render history from HTTP `session/load` replay stream."""
+        if self._transport != "http" or not self._lc_thread_id:
+            return
+        await self._ensure_http_session()
+        if self._service_transport is None or self._service_session_id is None:
+            return
+
+        assistant_message: AssistantMessage | None = None
+        tool_messages: dict[str, ToolCallMessage] = {}
+        had_content = False
+
+        try:
+            async for event in self._service_transport.load_session_stream(
+                self._service_session_id,
+                self._lc_thread_id,
+                cwd=self._cwd,
+            ):
+                payload = event.payload
+                if event.event_type == "text_delta":
+                    text = str(payload.get("text", ""))
+                    if not text:
+                        continue
+                    role = str(payload.get("role", "assistant"))
+                    had_content = True
+                    if role == "user":
+                        if assistant_message is not None:
+                            await assistant_message.stop_stream()
+                            assistant_message = None
+                        await self._mount_message(UserMessage(text))
+                        continue
+
+                    if assistant_message is None:
+                        assistant_message = AssistantMessage("")
+                        await self._mount_message(assistant_message)
+                    await assistant_message.append_content(text)
+                    continue
+
+                if event.event_type == "tool_call_started":
+                    if assistant_message is not None:
+                        await assistant_message.stop_stream()
+                        assistant_message = None
+                    tool_call_id = str(payload.get("tool_call_id", ""))
+                    name = str(payload.get("name", "unknown"))
+                    args = payload.get("args", {})
+                    parsed_args = args if isinstance(args, dict) else {}
+                    widget = ToolCallMessage(name, parsed_args)
+                    await self._mount_message(widget)
+                    if tool_call_id:
+                        tool_messages[tool_call_id] = widget
+                    had_content = True
+                    continue
+
+                if event.event_type == "tool_call_finished":
+                    tool_call_id = str(payload.get("tool_call_id", ""))
+                    output = str(payload.get("output", ""))
+                    status = str(payload.get("status", "success"))
+                    widget = tool_messages.get(tool_call_id)
+                    if widget:
+                        if status == "success":
+                            widget.set_success(output)
+                        elif status == "error":
+                            widget.set_error(output or "Error")
+                        else:
+                            widget.set_rejected()
+                    had_content = True
+                    continue
+
+                if event.event_type == "error":
+                    msg = str(payload.get("message", "Could not load history"))
+                    await self._mount_message(AppMessage(msg))
+                    return
+
+                if event.event_type == "done":
+                    break
+
+            if assistant_message is not None:
+                await assistant_message.stop_stream()
+
+            if had_content:
+                thread_msg = await self._build_thread_message(
+                    "Resumed thread", self._lc_thread_id
+                )
+                await self._mount_message(AppMessage(thread_msg))
+
+            self._scroll_chat_to_bottom()
+        except Exception as exc:
+            logger.exception("Failed to load HTTP history for %s", self._lc_thread_id)
+            await self._mount_message(AppMessage(f"Could not load history: {exc}"))
 
     async def _mount_message(
         self, widget: Static | AssistantMessage | ToolCallMessage
@@ -2207,7 +2624,7 @@ class DeepAgentsApp(App):
         Args:
             thread_id: The thread ID to resume.
         """
-        if not self._agent:
+        if self._transport != "http" and not self._agent:
             await self._mount_message(
                 AppMessage("Cannot switch threads: no active agent")
             )
@@ -2251,8 +2668,12 @@ class DeepAgentsApp(App):
                     thread_id,
                 )
 
-            # Load thread history
-            await self._load_thread_history()
+            if self._transport == "http":
+                await self._create_http_session(thread_id=thread_id)
+                await self._load_thread_history_http()
+            else:
+                # Load thread history
+                await self._load_thread_history()
 
         except Exception as exc:
             logger.exception("Failed to switch to thread %s", thread_id)
@@ -2270,7 +2691,11 @@ class DeepAgentsApp(App):
                 )
             # Attempt to restore the previous thread's visible history
             try:
-                await self._load_thread_history()
+                if self._transport == "http":
+                    await self._create_http_session(thread_id=prev_session_thread)
+                    await self._load_thread_history_http()
+                else:
+                    await self._load_thread_history()
             except Exception:  # noqa: BLE001  # Resilient session state saving
                 logger.debug(
                     "Could not restore previous thread history after "
@@ -2333,6 +2758,52 @@ class DeepAgentsApp(App):
         ):
             current = f"{settings.model_provider}:{settings.model_name}"
             await self._mount_message(AppMessage(f"Already using {current}"))
+            return
+
+        if self._transport == "http":
+            try:
+                result = create_model(model_spec)
+            except ModelConfigError as e:
+                await self._mount_message(ErrorMessage(str(e)))
+                return
+            except Exception as e:
+                logger.exception("Failed to create model from spec %s", model_spec)
+                await self._mount_message(ErrorMessage(f"Failed to create model: {e}"))
+                return
+
+            prev_name = settings.model_name
+            prev_provider = settings.model_provider
+            prev_context_limit = settings.model_context_limit
+            result.apply_to_settings()
+            self._model_name = f"{result.provider}:{result.model_name}"
+
+            try:
+                await self._create_http_session(thread_id=self._lc_thread_id)
+                await self._clear_messages()
+                self._message_store.clear()
+                if self._token_tracker:
+                    self._token_tracker.reset()
+                await self._load_thread_history_http()
+            except Exception as e:
+                settings.model_name = prev_name
+                settings.model_provider = prev_provider
+                settings.model_context_limit = prev_context_limit
+                logger.exception("Failed to switch HTTP model to %s", model_spec)
+                await self._mount_message(ErrorMessage(f"Model switch failed: {e}"))
+                return
+
+            display = f"{settings.model_provider}:{settings.model_name}"
+            if self._status_bar:
+                self._status_bar.set_model(display)
+            if save_recent_model(display):
+                await self._mount_message(AppMessage(f"Switched to {display}"))
+            else:
+                await self._mount_message(
+                    AppMessage(
+                        f"Switched to {display} (preference not saved - "
+                        "check ~/.deepagents/ permissions)"
+                    )
+                )
             return
 
         # Check if we have what we need for hot-swap
@@ -2507,6 +2978,10 @@ async def run_textual_app(
     tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
     sandbox: SandboxBackendProtocol | None = None,
     sandbox_type: str | None = None,
+    transport: str = "inproc",
+    service_url: str | None = None,
+    model_name: str | None = None,
+    model_params: dict[str, Any] | None = None,
 ) -> AppResult:
     """Run the Textual application.
 
@@ -2522,6 +2997,10 @@ async def run_textual_app(
         tools: Tools used to create the agent (for model hot-swap)
         sandbox: Sandbox backend (for model hot-swap)
         sandbox_type: Type of sandbox provider (for model hot-swap)
+        transport: Runtime transport (`"inproc"` or `"http"`).
+        service_url: Optional service URL in HTTP mode.
+        model_name: Model override used to create HTTP sessions.
+        model_params: Extra model kwargs for HTTP sessions.
 
     Returns:
         An `AppResult` with the return code and final thread ID.
@@ -2538,12 +3017,19 @@ async def run_textual_app(
         tools=tools,
         sandbox=sandbox,
         sandbox_type=sandbox_type,
+        transport=transport,
+        service_url=service_url,
+        model_name=model_name,
+        model_params=model_params,
     )
-    await app.run_async()
-    return AppResult(
-        return_code=app.return_code or 0,
-        thread_id=app._lc_thread_id,
-    )
+    try:
+        await app.run_async()
+        return AppResult(
+            return_code=app.return_code or 0,
+            thread_id=app._lc_thread_id,
+        )
+    finally:
+        await app._release_http_service()
 
 
 if __name__ == "__main__":

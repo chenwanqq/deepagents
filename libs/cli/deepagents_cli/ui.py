@@ -92,6 +92,12 @@ def show_help() -> None:
     console.print(
         "  --sandbox-setup PATH       Setup script to run in sandbox after creation"
     )
+    console.print(
+        "  --transport MODE           Execution transport: inproc or http"
+    )
+    console.print(
+        "  --service-url URL          Service base URL for --transport http"
+    )
     console.print("  -n, --non-interactive MSG  Run a single task and exit")
     console.print(
         "  --shell-allow-list CMDS    Comma-separated local shell commands to allow"

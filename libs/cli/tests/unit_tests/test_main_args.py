@@ -209,6 +209,31 @@ class TestModelParamsArgument:
             assert parsed.model_params == '{"temperature": 0.5, "max_tokens": 2048}'
 
 
+class TestTransportArguments:
+    """Tests for service transport arguments."""
+
+    def test_transport_default_inproc(self, mock_argv: MockArgvType) -> None:
+        """Default transport should be inproc when env var is unset."""
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            mock_argv(),
+        ):
+            parsed = parse_args()
+        assert parsed.transport == "inproc"
+
+    def test_transport_http_and_service_url(self, mock_argv: MockArgvType) -> None:
+        """Transport and service URL flags should parse correctly."""
+        with mock_argv(
+            "--transport",
+            "http",
+            "--service-url",
+            "http://127.0.0.1:9000",
+        ):
+            parsed = parse_args()
+        assert parsed.transport == "http"
+        assert parsed.service_url == "http://127.0.0.1:9000"
+
+
 def _make_args(
     *,
     non_interactive_message: str | None = None,
