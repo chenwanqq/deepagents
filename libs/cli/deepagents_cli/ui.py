@@ -96,6 +96,7 @@ def show_help() -> None:
     console.print(
         "  --sandbox-setup PATH       Setup script to run in sandbox after creation"
     )
+    console.print("  --taskiq-mode MODE        Background task runtime mode (default: inmemory)")
     console.print("  -n, --non-interactive MSG  Run a single task and exit")
     console.print("  -q, --quiet                Clean output for piping (needs -n)")
     console.print(

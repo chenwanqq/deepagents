@@ -38,6 +38,12 @@ from deepagents_cli.config import (
 )
 from deepagents_cli.integrations.sandbox_factory import get_default_working_dir
 from deepagents_cli.local_context import LocalContextMiddleware, _ExecutableBackend
+from deepagents_cli.background_tasks import (
+    BackgroundTasksMiddleware,
+    TaskiqMode,
+    TaskiqRuntime,
+    build_submit_background_task_tool,
+)
 from deepagents_cli.subagents import list_subagents
 
 DEFAULT_AGENT_NAME = "agent"
@@ -398,6 +404,8 @@ def create_cli_agent(
     enable_skills: bool = True,
     enable_shell: bool = True,
     checkpointer: BaseCheckpointSaver | None = None,
+    taskiq_runtime: TaskiqRuntime | None = None,
+    taskiq_mode: TaskiqMode = "inmemory",
 ) -> tuple[Pregel, CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -432,6 +440,9 @@ def create_cli_agent(
 
             If `None`, uses `InMemorySaver` (no persistence across
             CLI invocations).
+        taskiq_runtime: Optional in-memory runtime used to run background
+            tasks submitted via the `submit_background_task` tool.
+        taskiq_mode: Background task runtime mode.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -441,6 +452,7 @@ def create_cli_agent(
             - `composite_backend`: `CompositeBackend` for file operations
     """
     tools = tools or []
+    tool_list = list(tools)
 
     # Setup agent directory for persistent memory (if enabled)
     if enable_memory or enable_skills:
@@ -513,6 +525,11 @@ def create_cli_agent(
                 sources=sources,
             )
         )
+
+    if taskiq_runtime is not None:
+        taskiq_runtime.mode = taskiq_mode
+        agent_middleware.append(BackgroundTasksMiddleware(taskiq_runtime))
+        tool_list.append(build_submit_background_task_tool(taskiq_runtime))
 
     # CONDITIONAL SETUP: Local vs Remote Sandbox
     if sandbox is None:
@@ -610,7 +627,7 @@ def create_cli_agent(
     agent = create_deep_agent(
         model=model,
         system_prompt=system_prompt,
-        tools=tools,
+        tools=tool_list,
         backend=composite_backend,
         middleware=agent_middleware,
         interrupt_on=interrupt_on,
