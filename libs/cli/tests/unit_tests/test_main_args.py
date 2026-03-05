@@ -82,6 +82,20 @@ def test_shell_allow_list_string_parsing(input_str: str, expected: list[str]) ->
     assert result == expected
 
 
+def test_taskiq_mode_argument(mock_argv: MockArgvType) -> None:
+    """Test --taskiq-mode argument parsing."""
+    with mock_argv("--taskiq-mode", "inmemory"):
+        parsed_args = parse_args()
+        assert parsed_args.taskiq_mode == "inmemory"
+
+
+def test_taskiq_mode_default(mock_argv: MockArgvType) -> None:
+    """Test --taskiq-mode defaults to inmemory."""
+    with mock_argv():
+        parsed_args = parse_args()
+        assert parsed_args.taskiq_mode == "inmemory"
+
+
 class TestNonInteractiveArgument:
     """Tests for -n / --non-interactive argument parsing."""
 

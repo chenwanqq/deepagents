@@ -398,6 +398,12 @@ def parse_args() -> argparse.Namespace:
         help="Path to setup script to run in sandbox after creation",
     )
     parser.add_argument(
+        "--taskiq-mode",
+        choices=["inmemory"],
+        default="inmemory",
+        help="Background task runtime mode (default: inmemory)",
+    )
+    parser.add_argument(
         "--shell-allow-list",
         metavar="LIST",
         help="Comma-separated list of shell commands to auto-approve, "
@@ -446,6 +452,7 @@ async def run_textual_cli_async(
     thread_id: str | None = None,
     is_resumed: bool = False,
     initial_prompt: str | None = None,
+    taskiq_mode: str = "inmemory",
 ) -> "AppResult":
     """Run the Textual CLI interface (async version).
 
@@ -467,6 +474,7 @@ async def run_textual_cli_async(
         thread_id: Thread ID to use (new or resumed)
         is_resumed: Whether this is a resumed session
         initial_prompt: Optional prompt to auto-submit when session starts
+        taskiq_mode: Background task mode (currently only `inmemory`)
 
     Returns:
         An `AppResult` with the return code and final thread ID.
@@ -474,6 +482,11 @@ async def run_textual_cli_async(
     from rich.text import Text
 
     from deepagents_cli.agent import create_cli_agent
+    from deepagents_cli.background_tasks import (
+        clear_inmemory_background_state,
+        close_taskiq_runtime,
+        create_taskiq_runtime,
+    )
     from deepagents_cli.app import run_textual_app
     from deepagents_cli.config import console, create_model, settings
     from deepagents_cli.model_config import ModelConfigError
@@ -537,6 +550,8 @@ async def run_textual_cli_async(
                 console.print(Text(str(e), style="dim"))
                 sys.exit(1)
 
+        taskiq_runtime = await create_taskiq_runtime(taskiq_mode)
+
         try:
             agent, composite_backend = create_cli_agent(
                 model=model,
@@ -546,6 +561,8 @@ async def run_textual_cli_async(
                 sandbox_type=sandbox_type if sandbox_type != "none" else None,
                 auto_approve=auto_approve,
                 checkpointer=checkpointer,
+                taskiq_runtime=taskiq_runtime,
+                taskiq_mode=taskiq_mode,
             )
         except Exception as e:  # broad catch for friendly CLI errors
             logger.debug("Failed to create agent", exc_info=True)
@@ -555,6 +572,16 @@ async def run_textual_cli_async(
             if logger.isEnabledFor(logging.DEBUG):
                 console.print(Text(traceback.format_exc(), style="dim"))
             sys.exit(1)
+
+        background_reset_update = clear_inmemory_background_state(
+            is_resumed=is_resumed,
+            taskiq_mode=taskiq_mode,
+        )
+        if background_reset_update is not None and thread_id is not None:
+            await agent.aupdate_state(
+                {"configurable": {"thread_id": thread_id}},
+                background_reset_update,
+            )
 
         # Run Textual app - errors propagate to caller
         from deepagents_cli.app import AppResult
@@ -575,6 +602,7 @@ async def run_textual_cli_async(
                 sandbox_type=sandbox_type if sandbox_type != "none" else None,
             )
         finally:
+            await close_taskiq_runtime(taskiq_runtime)
             # Clean up sandbox after app exits (success or error)
             if sandbox_cm is not None:
                 try:
@@ -1029,6 +1057,7 @@ def cli_main() -> None:
                         thread_id=thread_id,
                         is_resumed=is_resumed,
                         initial_prompt=getattr(args, "initial_prompt", None),
+                        taskiq_mode=getattr(args, "taskiq_mode", "inmemory"),
                     )
                 )
                 return_code = result.return_code

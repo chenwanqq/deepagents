@@ -743,3 +743,37 @@ class TestMiddlewareStackConformance:
             assert isinstance(mw, AgentMiddleware), (
                 f"{type(mw).__name__} does not inherit from AgentMiddleware"
             )
+
+
+def test_create_cli_agent_registers_background_tool() -> None:
+    """`create_cli_agent` should register background middleware/tool when runtime is set."""
+    from deepagents_cli.background_tasks import TaskiqRuntime
+
+    captured: dict[str, Any] = {}
+
+    class _FakeBuilder:
+        def with_config(self, cfg: Any) -> str:
+            return "agent"
+
+    def _fake_create_deep_agent(**kwargs: Any) -> _FakeBuilder:
+        captured.update(kwargs)
+        return _FakeBuilder()
+
+    with patch(
+        "deepagents_cli.agent.create_deep_agent",
+        side_effect=_fake_create_deep_agent,
+    ):
+        agent, _ = create_cli_agent(
+            model=_make_fake_chat_model(),
+            assistant_id="agent",
+            enable_memory=False,
+            enable_skills=False,
+            taskiq_runtime=TaskiqRuntime(),
+            taskiq_mode="inmemory",
+        )
+
+    assert agent == "agent"
+    tools = captured["tools"]
+    assert any(
+        getattr(tool, "__name__", "") == "submit_background_task" for tool in tools
+    )
