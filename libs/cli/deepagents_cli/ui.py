@@ -104,6 +104,12 @@ def show_help() -> None:
     console.print(
         "  --shell-allow-list CMDS    Comma-separated local shell commands to allow"
     )
+    console.print(
+        "  --taskiq-mode MODE         Background task mode (default: inmemory)"
+    )
+    console.print(
+        "  --background-tasks, --no-background-tasks  Enable/disable background task runtime (default: enabled)"  # noqa: E501
+    )
     console.print("  --default-model [MODEL]    Set, show, or manage the default model")
     console.print("  --clear-default-model      Clear the default model")
     console.print("  -v, --version              Show deepagents CLI and SDK versions")

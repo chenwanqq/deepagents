@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from langgraph.pregel import Pregel
     from langgraph.runtime import Runtime
 
+    from deepagents_cli.background_tasks import TaskiqMode, TaskiqRuntime
+
 from deepagents_cli.config import (
     COLORS,
     config,
@@ -321,6 +323,28 @@ def _format_execute_description(
     return f"Execute Command: {command}\nWorking Directory: {Path.cwd()}"
 
 
+def _format_submit_background_task_description(
+    tool_call: ToolCall, _state: AgentState[Any], _runtime: Runtime[Any]
+) -> str:
+    """Format submit_background_task call for approval prompt.
+
+    Returns:
+        Human-readable description for HITL approval.
+    """
+    args = tool_call["args"]
+    job_kind = args.get("job_kind", "unknown")
+    payload = args.get("input", {})
+    if isinstance(payload, dict) and job_kind == "shell_command":
+        command = payload.get("command", "unknown")
+        timeout = payload.get("timeout")
+        return (
+            f"Background job kind: shell_command\n"
+            f"Command: {command}\n"
+            f"Timeout: {timeout if timeout is not None else 'default'}"
+        )
+    return f"Background job kind: {job_kind}"
+
+
 def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
     """Configure human-in-the-loop interrupt settings for all gated tools.
 
@@ -361,6 +385,10 @@ def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
         "allowed_decisions": ["approve", "reject"],
         "description": _format_task_description,  # type: ignore[typeddict-item]  # Callable description narrower than TypedDict expects
     }
+    submit_background_task_interrupt_config: InterruptOnConfig = {
+        "allowed_decisions": ["approve", "reject"],
+        "description": _format_submit_background_task_description,  # type: ignore[typeddict-item]  # Callable description narrower than TypedDict expects
+    }
 
     interrupt_map: dict[str, InterruptOnConfig] = {
         "execute": execute_interrupt_config,
@@ -369,6 +397,7 @@ def _add_interrupt_on() -> dict[str, InterruptOnConfig]:
         "web_search": web_search_interrupt_config,
         "fetch_url": fetch_url_interrupt_config,
         "task": task_interrupt_config,
+        "submit_background_task": submit_background_task_interrupt_config,
     }
 
     if REQUIRE_COMPACT_TOOL_APPROVAL:
@@ -398,6 +427,8 @@ def create_cli_agent(
     enable_skills: bool = True,
     enable_shell: bool = True,
     checkpointer: BaseCheckpointSaver | None = None,
+    taskiq_runtime: TaskiqRuntime | None = None,
+    taskiq_mode: TaskiqMode = "inmemory",
 ) -> tuple[Pregel, CompositeBackend]:
     """Create a CLI-configured agent with flexible options.
 
@@ -432,6 +463,8 @@ def create_cli_agent(
 
             If `None`, uses `InMemorySaver` (no persistence across
             CLI invocations).
+        taskiq_runtime: Optional background-task runtime.
+        taskiq_mode: Background task mode. First version supports `inmemory`.
 
     Returns:
         2-tuple of `(agent_graph, backend)`
@@ -440,7 +473,7 @@ def create_cli_agent(
                 for execution
             - `composite_backend`: `CompositeBackend` for file operations
     """
-    tools = tools or []
+    tools = list(tools or [])
 
     # Setup agent directory for persistent memory (if enabled)
     if enable_memory or enable_skills:
@@ -546,6 +579,16 @@ def create_cli_agent(
     # Only enabled when the backend supports shell execution.
     if isinstance(backend, _ExecutableBackend):
         agent_middleware.append(LocalContextMiddleware(backend=backend))
+
+    if taskiq_runtime is not None:
+        from deepagents_cli.background_middleware import BackgroundTasksMiddleware
+
+        agent_middleware.append(
+            BackgroundTasksMiddleware(
+                taskiq_runtime=taskiq_runtime,
+                taskiq_mode=taskiq_mode,
+            )
+        )
 
     # Get or use custom system prompt
     if system_prompt is None:

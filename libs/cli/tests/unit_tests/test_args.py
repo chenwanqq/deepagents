@@ -226,6 +226,44 @@ class TestShortFlags:
         assert exc_info.value.code in (0, None)
 
 
+class TestTaskiqModeArg:
+    """Tests for --taskiq-mode parsing."""
+
+    def test_default_is_inmemory(self) -> None:
+        """Verify taskiq_mode defaults to inmemory."""
+        with patch.object(sys, "argv", ["deepagents"]):
+            args = parse_args()
+        assert args.taskiq_mode == "inmemory"
+
+    def test_explicit_inmemory(self) -> None:
+        """Verify --taskiq-mode inmemory is accepted."""
+        with patch.object(sys, "argv", ["deepagents", "--taskiq-mode", "inmemory"]):
+            args = parse_args()
+        assert args.taskiq_mode == "inmemory"
+
+
+class TestBackgroundTasksArg:
+    """Tests for --background-tasks / --no-background-tasks parsing."""
+
+    def test_default_enabled(self) -> None:
+        """Verify background tasks are enabled by default."""
+        with patch.object(sys, "argv", ["deepagents"]):
+            args = parse_args()
+        assert args.background_tasks is True
+
+    def test_explicit_disable(self) -> None:
+        """Verify --no-background-tasks disables background tasks."""
+        with patch.object(sys, "argv", ["deepagents", "--no-background-tasks"]):
+            args = parse_args()
+        assert args.background_tasks is False
+
+    def test_explicit_enable(self) -> None:
+        """Verify --background-tasks explicitly enables background tasks."""
+        with patch.object(sys, "argv", ["deepagents", "--background-tasks"]):
+            args = parse_args()
+        assert args.background_tasks is True
+
+
 class TestQuietArg:
     """Tests for -q/--quiet argument parsing."""
 

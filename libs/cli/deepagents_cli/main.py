@@ -21,10 +21,11 @@ import sys
 import traceback
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from deepagents_cli.app import AppResult
+    from deepagents_cli.background_tasks import TaskiqMode
 
 # Suppress Pydantic v1 compatibility warnings from langchain on Python 3.14+
 warnings.filterwarnings("ignore", message=".*Pydantic V1.*", category=UserWarning)
@@ -404,6 +405,22 @@ def parse_args() -> argparse.Namespace:
         "or 'recommended' for safe defaults. "
         "Applies to both -n and interactive modes.",
     )
+    parser.add_argument(
+        "--taskiq-mode",
+        choices=["inmemory"],
+        default="inmemory",
+        help="Background task runtime mode (default: inmemory).",
+    )
+    parser.add_argument(
+        "--background-tasks",
+        dest="background_tasks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Enable background task tools and runtime "
+            "(default: enabled). Use --no-background-tasks to disable."
+        ),
+    )
 
     try:
         from importlib.metadata import (
@@ -446,6 +463,8 @@ async def run_textual_cli_async(
     thread_id: str | None = None,
     is_resumed: bool = False,
     initial_prompt: str | None = None,
+    taskiq_mode: "TaskiqMode" = "inmemory",
+    background_tasks: bool = True,
 ) -> "AppResult":
     """Run the Textual CLI interface (async version).
 
@@ -467,6 +486,8 @@ async def run_textual_cli_async(
         thread_id: Thread ID to use (new or resumed)
         is_resumed: Whether this is a resumed session
         initial_prompt: Optional prompt to auto-submit when session starts
+        taskiq_mode: Background task runtime mode.
+        background_tasks: Whether to enable background task tools and runtime.
 
     Returns:
         An `AppResult` with the return code and final thread ID.
@@ -475,6 +496,10 @@ async def run_textual_cli_async(
 
     from deepagents_cli.agent import create_cli_agent
     from deepagents_cli.app import run_textual_app
+    from deepagents_cli.background_tasks import (
+        close_taskiq_runtime,
+        create_taskiq_runtime,
+    )
     from deepagents_cli.config import console, create_model, settings
     from deepagents_cli.model_config import ModelConfigError
     from deepagents_cli.sessions import get_checkpointer
@@ -537,6 +562,11 @@ async def run_textual_cli_async(
                 console.print(Text(str(e), style="dim"))
                 sys.exit(1)
 
+        taskiq_runtime = None
+        if background_tasks:
+            taskiq_runtime = create_taskiq_runtime(mode=taskiq_mode)
+            await taskiq_runtime.startup()
+
         try:
             agent, composite_backend = create_cli_agent(
                 model=model,
@@ -546,6 +576,8 @@ async def run_textual_cli_async(
                 sandbox_type=sandbox_type if sandbox_type != "none" else None,
                 auto_approve=auto_approve,
                 checkpointer=checkpointer,
+                taskiq_runtime=taskiq_runtime,
+                taskiq_mode=taskiq_mode,
             )
         except Exception as e:  # broad catch for friendly CLI errors
             logger.debug("Failed to create agent", exc_info=True)
@@ -554,7 +586,37 @@ async def run_textual_cli_async(
             console.print(error_text)
             if logger.isEnabledFor(logging.DEBUG):
                 console.print(Text(traceback.format_exc(), style="dim"))
+            await close_taskiq_runtime(taskiq_runtime)
             sys.exit(1)
+        if taskiq_runtime is not None:
+            taskiq_runtime.bind_agent(agent)
+
+        if (
+            taskiq_runtime is not None
+            and is_resumed
+            and taskiq_mode == "inmemory"
+            and thread_id
+        ):
+            from langchain_core.messages import HumanMessage
+
+            await agent.aupdate_state(
+                {"configurable": {"thread_id": thread_id}},
+                {
+                    "active_background_task_ids": [],
+                    "background_hitl_queue": [],
+                    "background_hitl_resumes": {},
+                    "messages": [
+                        HumanMessage(
+                            content=(
+                                "[SYSTEM] Background tasks and pending approvals "
+                                "cannot be "
+                                "resumed in taskiq mode 'inmemory'; stale runtime "
+                                "state has been cleared."
+                            )
+                        )
+                    ],
+                },
+            )
 
         # Run Textual app - errors propagate to caller
         from deepagents_cli.app import AppResult
@@ -573,8 +635,10 @@ async def run_textual_cli_async(
                 tools=tools,
                 sandbox=sandbox_backend,
                 sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                taskiq_runtime=taskiq_runtime,
             )
         finally:
+            await close_taskiq_runtime(taskiq_runtime)
             # Clean up sandbox after app exits (success or error)
             if sandbox_cm is not None:
                 try:
@@ -1029,6 +1093,14 @@ def cli_main() -> None:
                         thread_id=thread_id,
                         is_resumed=is_resumed,
                         initial_prompt=getattr(args, "initial_prompt", None),
+                        taskiq_mode=cast(
+                            "TaskiqMode",
+                            getattr(args, "taskiq_mode", "inmemory"),
+                        ),
+                        background_tasks=cast(
+                            "bool",
+                            getattr(args, "background_tasks", True),
+                        ),
                     )
                 )
                 return_code = result.return_code

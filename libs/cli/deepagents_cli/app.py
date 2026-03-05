@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import uuid
 import webbrowser
 from collections import deque
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
+from langchain_core.messages import HumanMessage
 from rich.text import Text
 from textual.app import App
 from textual.binding import Binding, BindingType
@@ -80,6 +82,8 @@ if TYPE_CHECKING:
     from textual.scrollbar import ScrollUp
     from textual.widget import Widget
     from textual.worker import Worker
+
+    from deepagents_cli.background_tasks import TaskiqRuntime
 
 # iTerm2 Cursor Guide Workaround
 # ===============================
@@ -439,6 +443,7 @@ class DeepAgentsApp(App):
         tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
         sandbox: SandboxBackendProtocol | None = None,
         sandbox_type: str | None = None,
+        taskiq_runtime: TaskiqRuntime | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the Deep Agents application.
@@ -455,6 +460,7 @@ class DeepAgentsApp(App):
             tools: Tools used to create the agent (for model hot-swap)
             sandbox: Sandbox backend (for model hot-swap)
             sandbox_type: Type of sandbox provider (for model hot-swap)
+            taskiq_runtime: Optional background task runtime.
             **kwargs: Additional arguments passed to parent
         """
         super().__init__(**kwargs)
@@ -471,6 +477,7 @@ class DeepAgentsApp(App):
         self._tools = tools or []
         self._sandbox = sandbox
         self._sandbox_type = sandbox_type
+        self._taskiq_runtime = taskiq_runtime
         self._status_bar: StatusBar | None = None
         self._chat_input: ChatInput | None = None
         self._quit_pending = False
@@ -493,6 +500,7 @@ class DeepAgentsApp(App):
         self._queued_widgets: deque[QueuedUserMessage] = deque()
         self._processing_pending = False
         self._thread_switching = False
+        self._background_polling = False
         # Message virtualization store
         self._message_store = MessageStore()
         # Lazily imported here to avoid pulling image dependencies into
@@ -567,6 +575,12 @@ class DeepAgentsApp(App):
                 exclusive=True,
                 group="startup-thread-prewarm",
             )
+            if self._taskiq_runtime is not None:
+                self.run_worker(
+                    self._poll_background_runtime,
+                    exclusive=True,
+                    group="background-runtime-poller",
+                )
 
         # Background update check (opt-out via DEEPAGENTS_NO_UPDATE_CHECK)
         if not os.environ.get("DEEPAGENTS_NO_UPDATE_CHECK"):
@@ -656,6 +670,164 @@ class DeepAgentsApp(App):
                 )
         except Exception:
             logger.debug("Background update check failed", exc_info=True)
+
+    async def _poll_background_runtime(self) -> None:
+        """Poll background runtime for task events and pending HITL approvals."""
+        self._background_polling = True
+        try:
+            while not self._exit:
+                await asyncio.sleep(0.4)
+                if (
+                    self._taskiq_runtime is None
+                    or self._agent is None
+                    or self._session_state is None
+                ):
+                    continue
+                thread_id = self._session_state.thread_id
+                await self._drain_background_events(thread_id)
+                await self._maybe_process_background_hitl(thread_id)
+        except Exception:
+            logger.exception("Background runtime poller crashed")
+        finally:
+            self._background_polling = False
+
+    async def _drain_background_events(self, thread_id: str) -> None:
+        """Drain completion/failure events from the runtime."""
+        if self._taskiq_runtime is None:
+            return
+        events = self._taskiq_runtime.pop_events(thread_id)
+        if not events:
+            return
+        for event in events:
+            await self._mount_message(AppMessage(event.message))
+            if self._agent is not None:
+                try:
+                    await self._agent.aupdate_state(
+                        {"configurable": {"thread_id": thread_id}},
+                        {"messages": [HumanMessage(content=event.message)]},
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to append background event message",
+                        exc_info=True,
+                    )
+
+    async def _maybe_process_background_hitl(self, thread_id: str) -> None:
+        """Process one queued background HITL request at a time."""
+        if self._agent is None or self._pending_approval_widget is not None:
+            return
+        state = await self._agent.aget_state({"configurable": {"thread_id": thread_id}})
+        if not state or not state.values:
+            return
+        queue = state.values.get("background_hitl_queue", [])
+        if not isinstance(queue, list) or not queue:
+            return
+        item = queue[0]
+        if not isinstance(item, dict):
+            return
+
+        task_id = item.get("task_id")
+        interrupt_id = item.get("interrupt_id")
+        if not isinstance(task_id, str) or not isinstance(interrupt_id, str):
+            return
+
+        deadline_ts = item.get("deadline_ts")
+        if isinstance(deadline_ts, (int, float)) and deadline_ts < time.time():
+            await self._write_background_resume(
+                thread_id=thread_id,
+                item=item,
+                decisions=[{"type": "reject"}],
+            )
+            await self._mount_message(
+                AppMessage(
+                    "[SYSTEM] Background approval timed out and was "
+                    "automatically rejected."
+                )
+            )
+            return
+
+        action_requests = item.get("action_requests", [])
+        if not isinstance(action_requests, list) or not action_requests:
+            return
+
+        payload_preview = item.get("payload_preview", "")
+        job_kind = item.get("job_kind", "unknown")
+        prefixed_requests: list[dict[str, Any]] = []
+        for req in action_requests:
+            if not isinstance(req, dict):
+                continue
+            req_copy = dict(req)
+            existing_desc = req_copy.get("description")
+            header = (
+                "[Background task approval]\n"
+                f"task_id={task_id}\n"
+                f"job_kind={job_kind}\n"
+                f"payload={payload_preview}\n\n"
+            )
+            req_copy["description"] = (
+                f"{header}{existing_desc}" if isinstance(existing_desc, str) else header
+            )
+            prefixed_requests.append(req_copy)
+        if not prefixed_requests:
+            return
+
+        future = await self._request_approval(prefixed_requests, self._assistant_id)
+        decision = await future
+        decisions = self._build_background_decisions(decision, len(prefixed_requests))
+        await self._write_background_resume(
+            thread_id=thread_id,
+            item=item,
+            decisions=decisions,
+        )
+
+    @staticmethod
+    def _build_background_decisions(
+        decision: dict[str, str] | Any,  # noqa: ANN401  # Dynamic decision payload
+        count: int,
+    ) -> list[dict[str, str]]:
+        """Translate approval menu result into HITL decisions.
+
+        Returns:
+            List of HITL decisions aligned with queued action request count.
+        """
+        decision_type = decision.get("type") if isinstance(decision, dict) else None
+        if decision_type in {"approve", "auto_approve_all"}:
+            return [{"type": "approve"} for _ in range(count)]
+        return [{"type": "reject"} for _ in range(count)]
+
+    async def _write_background_resume(
+        self,
+        *,
+        thread_id: str,
+        item: dict[str, Any],
+        decisions: list[dict[str, str]],
+    ) -> None:
+        """Write `background_hitl_resumes` and consume queue item."""
+        if self._agent is None:
+            return
+        state = await self._agent.aget_state({"configurable": {"thread_id": thread_id}})
+        if not state or not state.values:
+            return
+        queue = [
+            q
+            for q in list(state.values.get("background_hitl_queue", []))
+            if not (
+                isinstance(q, dict)
+                and q.get("task_id") == item.get("task_id")
+                and q.get("interrupt_id") == item.get("interrupt_id")
+            )
+        ]
+        resumes = dict(state.values.get("background_hitl_resumes", {}))
+        task_id = str(item.get("task_id"))
+        interrupt_id = str(item.get("interrupt_id"))
+        resumes[task_id] = {"interrupt_id": interrupt_id, "decisions": decisions}
+        await self._agent.aupdate_state(
+            {"configurable": {"thread_id": thread_id}},
+            {
+                "background_hitl_queue": queue,
+                "background_hitl_resumes": resumes,
+            },
+        )
 
     def on_scroll_up(self, _event: ScrollUp) -> None:
         """Handle scroll up to check if we need to hydrate older messages."""
@@ -2875,6 +3047,12 @@ class DeepAgentsApp(App):
                 sandbox_type=self._sandbox_type,
                 auto_approve=self._auto_approve,
                 checkpointer=self._checkpointer,
+                taskiq_runtime=self._taskiq_runtime,
+                taskiq_mode=(
+                    self._taskiq_runtime.mode
+                    if self._taskiq_runtime is not None
+                    else "inmemory"
+                ),
             )
         except Exception as e:
             # Roll back settings so the running agent isn't misrepresented.
@@ -2888,6 +3066,8 @@ class DeepAgentsApp(App):
         # Swap agent
         self._agent = new_agent
         self._backend = new_backend
+        if self._taskiq_runtime is not None:
+            self._taskiq_runtime.bind_agent(new_agent)
 
         # Post-swap: update UI and save config
         display = f"{settings.model_provider}:{settings.model_name}"
@@ -2999,6 +3179,7 @@ async def run_textual_app(
     tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
     sandbox: SandboxBackendProtocol | None = None,
     sandbox_type: str | None = None,
+    taskiq_runtime: TaskiqRuntime | None = None,
 ) -> AppResult:
     """Run the Textual application.
 
@@ -3014,6 +3195,7 @@ async def run_textual_app(
         tools: Tools used to create the agent (for model hot-swap)
         sandbox: Sandbox backend (for model hot-swap)
         sandbox_type: Type of sandbox provider (for model hot-swap)
+        taskiq_runtime: Optional background task runtime.
 
     Returns:
         An `AppResult` with the return code and final thread ID.
@@ -3030,6 +3212,7 @@ async def run_textual_app(
         tools=tools,
         sandbox=sandbox,
         sandbox_type=sandbox_type,
+        taskiq_runtime=taskiq_runtime,
     )
     await app.run_async()
     return AppResult(

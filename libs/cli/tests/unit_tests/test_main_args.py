@@ -67,6 +67,34 @@ def test_shell_allow_list_combined_with_other_args(mock_argv: MockArgvType) -> N
         assert parsed_args.auto_approve is True
 
 
+def test_taskiq_mode_default(mock_argv: MockArgvType) -> None:
+    """--taskiq-mode defaults to inmemory."""
+    with mock_argv():
+        parsed_args = parse_args()
+        assert parsed_args.taskiq_mode == "inmemory"
+
+
+def test_taskiq_mode_explicit(mock_argv: MockArgvType) -> None:
+    """--taskiq-mode accepts explicit supported values."""
+    with mock_argv("--taskiq-mode", "inmemory"):
+        parsed_args = parse_args()
+        assert parsed_args.taskiq_mode == "inmemory"
+
+
+def test_background_tasks_default_enabled(mock_argv: MockArgvType) -> None:
+    """--background-tasks defaults to enabled."""
+    with mock_argv():
+        parsed_args = parse_args()
+        assert parsed_args.background_tasks is True
+
+
+def test_background_tasks_can_be_disabled(mock_argv: MockArgvType) -> None:
+    """--no-background-tasks disables background task runtime."""
+    with mock_argv("--no-background-tasks"):
+        parsed_args = parse_args()
+        assert parsed_args.background_tasks is False
+
+
 @pytest.mark.parametrize(
     ("input_str", "expected"),
     [

@@ -5,7 +5,8 @@ import io
 import os
 import signal
 import webbrowser
-from typing import ClassVar
+from types import SimpleNamespace
+from typing import Any, ClassVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -32,6 +33,66 @@ from deepagents_cli.widgets.messages import (
     QueuedUserMessage,
     UserMessage,
 )
+
+
+class _StateAgent:
+    """Minimal stateful agent stub for app state update tests."""
+
+    def __init__(self) -> None:
+        self._state: dict[str, dict[str, object]] = {}
+
+    @staticmethod
+    def _thread_id_from_config(config: dict[str, Any]) -> str:
+        configurable = config.get("configurable", {})
+        if isinstance(configurable, dict):
+            thread_id = configurable.get("thread_id", "")
+            return str(thread_id)
+        return ""
+
+    async def aget_state(self, config: dict[str, Any]) -> SimpleNamespace:
+        thread_id = self._thread_id_from_config(config)
+        return SimpleNamespace(values=self._state.get(thread_id, {}))
+
+    async def aupdate_state(
+        self, config: dict[str, Any], update: dict[str, object]
+    ) -> None:
+        thread_id = self._thread_id_from_config(config)
+        merged = dict(self._state.get(thread_id, {}))
+        merged.update(update)
+        self._state[thread_id] = merged
+
+
+async def test_write_background_resume_marks_task_running() -> None:
+    """Writing background resume should consume queue item and write decisions."""
+    app = DeepAgentsApp()
+    agent = _StateAgent()
+    app._agent = agent
+    thread_id = "thread-bg-status"
+    await agent.aupdate_state(
+        {"configurable": {"thread_id": thread_id}},
+        {
+            "background_hitl_queue": [
+                {
+                    "task_id": "bg-1",
+                    "interrupt_id": "int-1",
+                    "action_requests": [{"name": "execute", "args": {"command": "ls"}}],
+                }
+            ],
+            "background_hitl_resumes": {},
+        },
+    )
+
+    await app._write_background_resume(
+        thread_id=thread_id,
+        item={"task_id": "bg-1", "interrupt_id": "int-1"},
+        decisions=[{"type": "approve"}],
+    )
+
+    state = (
+        await agent.aget_state({"configurable": {"thread_id": thread_id}})
+    ).values
+    assert state["background_hitl_queue"] == []
+    assert state["background_hitl_resumes"]["bg-1"]["decisions"][0]["type"] == "approve"
 
 
 class TestInitialPromptOnMount:
